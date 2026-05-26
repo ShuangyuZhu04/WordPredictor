@@ -1,0 +1,10 @@
+# Word Predictor – dependencies
+#
+# Install:   pip install -r requirements.txt
+# Launch:    python app.py
+#
+torch>=2.0
+transformers>=4.30
+tokenizers>=0.15
+gradio>=4.0
+nltk>=3.8
