@@ -100,6 +100,7 @@ class CausalTransformerLM(nn.Module):
             dim_feedforward=d_model * 4,
             dropout=dropout,
             batch_first=True,
+            norm_first=True,
         )
 
         self.transformer = nn.TransformerEncoder(
@@ -509,81 +510,81 @@ class SmallTransformerPredictor:
         )
 
 
-# ===================================================================== #
-#  GPT2Predictor  (for use when HuggingFace Hub is reachable)            #
-# ===================================================================== #
+# # ===================================================================== #
+# #  GPT2Predictor  (for use when HuggingFace Hub is reachable)            #
+# # ===================================================================== #
 
 
-class GPT2Predictor:
-    """Word predictor wrapping the pre-trained GPT-2 model.
+# class GPT2Predictor:
+#     """Word predictor wrapping the pre-trained GPT-2 model.
 
-    Requires internet to download weights on first use.
-    After that, models are cached locally.
+#     Requires internet to download weights on first use.
+#     After that, models are cached locally.
 
-    Parameters
-    ----------
-    model_name : str   e.g. 'gpt2', 'gpt2-medium'
-    """
+#     Parameters
+#     ----------
+#     model_name : str   e.g. 'gpt2', 'gpt2-medium'
+#     """
 
-    def __init__(self, model_name: str = "gpt2"):
-        self.model_name = model_name
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.tokenizer = None
-        self.model = None
+#     def __init__(self, model_name: str = "gpt2"):
+#         self.model_name = model_name
+#         self.device = "cuda" if torch.cuda.is_available() else "cpu"
+#         self.tokenizer = None
+#         self.model = None
 
-    def load(self) -> None:
-        """Download (or load from cache) the GPT-2 model."""
-        from transformers import GPT2LMHeadModel, GPT2Tokenizer  # noqa: E402
+#     def load(self) -> None:
+#         """Download (or load from cache) the GPT-2 model."""
+#         from transformers import GPT2LMHeadModel, GPT2Tokenizer  # noqa: E402
 
-        self.tokenizer = GPT2Tokenizer.from_pretrained(self.model_name)
-        self.model = GPT2LMHeadModel.from_pretrained(self.model_name).to(self.device)
-        self.model.eval()
-        n_params = sum(p.numel() for p in self.model.parameters())
-        print(f"  Loaded {self.model_name}: {n_params // 1_000_000}M params")
+#         self.tokenizer = GPT2Tokenizer.from_pretrained(self.model_name)
+#         self.model = GPT2LMHeadModel.from_pretrained(self.model_name).to(self.device)
+#         self.model.eval()
+#         n_params = sum(p.numel() for p in self.model.parameters())
+#         print(f"  Loaded {self.model_name}: {n_params // 1_000_000}M params")
 
-    @torch.no_grad()
-    def predict(
-        self,
-        context: List[str],
-        prefix: str = "",
-        top_k: int = 5,
-    ) -> List[Tuple[str, float]]:
-        """Predict the next whole word (same API as NGramPredictor)."""
-        if self.model is None:
-            raise RuntimeError("Call .load() first.")
+#     @torch.no_grad()
+#     def predict(
+#         self,
+#         context: List[str],
+#         prefix: str = "",
+#         top_k: int = 5,
+#     ) -> List[Tuple[str, float]]:
+#         """Predict the next whole word (same API as NGramPredictor)."""
+#         if self.model is None:
+#             raise RuntimeError("Call .load() first.")
 
-        prefix = prefix.lower().strip()
-        context_text = " ".join(context).strip()
-        if prefix:
-            context_text += " " + prefix
+#         prefix = prefix.lower().strip()
+#         context_text = " ".join(context).strip()
+#         if prefix:
+#             context_text += " " + prefix
 
-        if not context_text:
-            context_text = " "
+#         if not context_text:
+#             context_text = " "
 
-        input_ids = self.tokenizer.encode(context_text, return_tensors="pt").to(
-            self.device
-        )
-        logits = self.model(input_ids).logits
-        next_logits = logits[0, -1, :]
-        probs = F.softmax(next_logits, dim=-1)
+#         input_ids = self.tokenizer.encode(context_text, return_tensors="pt").to(
+#             self.device
+#         )
+#         logits = self.model(input_ids).logits
+#         next_logits = logits[0, -1, :]
+#         probs = F.softmax(next_logits, dim=-1)
 
-        # GPT-2 BPE: tokens starting with 'Ġ' mark word boundaries
-        raw_top_k = min(300, probs.shape[0])
-        top_probs, top_ids = probs.topk(raw_top_k)
+#         # GPT-2 BPE: tokens starting with 'Ġ' mark word boundaries
+#         raw_top_k = min(300, probs.shape[0])
+#         top_probs, top_ids = probs.topk(raw_top_k)
 
-        word_scores: dict[str, float] = {}
+#         word_scores: dict[str, float] = {}
 
-        for prob_val, token_id in zip(top_probs.tolist(), top_ids.tolist()):
-            token_str = self.tokenizer.decode([token_id]).strip().lower()
-            if not token_str or not token_str.isalpha():
-                continue
-            if token_str.startswith(prefix):
-                word_scores[token_str] = word_scores.get(token_str, 0.0) + prob_val
+#         for prob_val, token_id in zip(top_probs.tolist(), top_ids.tolist()):
+#             token_str = self.tokenizer.decode([token_id]).strip().lower()
+#             if not token_str or not token_str.isalpha():
+#                 continue
+#             if token_str.startswith(prefix):
+#                 word_scores[token_str] = word_scores.get(token_str, 0.0) + prob_val
 
-        ranked = sorted(word_scores.items(), key=lambda x: -x[1])[:top_k]
-        total = sum(s for _, s in ranked) or 1.0
-        return [(w, round(s / total, 4)) for w, s in ranked]
+#         ranked = sorted(word_scores.items(), key=lambda x: -x[1])[:top_k]
+#         total = sum(s for _, s in ranked) or 1.0
+#         return [(w, round(s / total, 4)) for w, s in ranked]
 
-    def __repr__(self) -> str:
-        status = "loaded" if self.model else "not loaded"
-        return f"GPT2Predictor(model='{self.model_name}', {status})"
+#     def __repr__(self) -> str:
+#         status = "loaded" if self.model else "not loaded"
+#         return f"GPT2Predictor(model='{self.model_name}', {status})"

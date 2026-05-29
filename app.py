@@ -12,6 +12,7 @@ Then open http://localhost:7860 in your browser.
 
 from __future__ import annotations
 
+import os
 import time
 import re
 from typing import List, Tuple
@@ -23,20 +24,23 @@ from spell_corrector import SpellCorrector
 from transformer_predictor import SmallTransformerPredictor
 from corpus_loader import load_corpus
 
-
 # ===================================================================== #
 #  Load Brown corpus (downloads automatically on first run)              #
 # ===================================================================== #
 
 TRAIN_CORPUS, _ = load_corpus(
-    categories=["news"],          # single genre for fast startup
-    max_train_words=30_000,       # balance vocab richness vs speed
+    categories=["news"],  # single genre for fast startup
+    max_train_words=30_000,  # balance vocab richness vs speed
 )
+
+# Directory where the trained Transformer is cached between runs
+TRANSFORMER_CHECKPOINT = "./transformer_checkpoint"
 
 
 # ===================================================================== #
 #  Initialise models (runs once at startup)                              #
 # ===================================================================== #
+
 
 def load_models():
     """Train and return all models + the spell corrector."""
@@ -50,14 +54,27 @@ def load_models():
     spell.train_from_counter(ngram.word_freq, ngram.vocabulary)
     print(f"  {spell}")
 
-    print("Training Transformer model …")
     transformer = SmallTransformerPredictor(
-        vocab_size=1000, d_model=64, n_heads=4, n_layers=2, max_seq_len=64,
+        vocab_size=1000,
+        d_model=64,
+        n_heads=4,
+        n_layers=2,
+        max_seq_len=64,
     )
-    transformer.train(
-        TRAIN_CORPUS, epochs=60, lr=3e-3, batch_size=16,
-        seq_len=32, log_every=20,
-    )
+    if os.path.exists(os.path.join(TRANSFORMER_CHECKPOINT, "model.pt")):
+        print("Loading saved Transformer model …")
+        transformer.load(TRANSFORMER_CHECKPOINT)
+    else:
+        print("Training Transformer model …")
+        transformer.train(
+            TRAIN_CORPUS,
+            epochs=60,
+            lr=3e-3,
+            batch_size=16,
+            seq_len=32,
+            log_every=20,
+        )
+        transformer.save(TRANSFORMER_CHECKPOINT)
     print(f"  {transformer}")
 
     return ngram, spell, transformer
@@ -78,6 +95,7 @@ TOP_K = 5
 # ===================================================================== #
 #  Core prediction logic                                                 #
 # ===================================================================== #
+
 
 def parse_input(text: str) -> Tuple[List[str], str]:
     """Split the input text into confirmed context words and a prefix.
@@ -119,9 +137,7 @@ def get_predictions(text: str, model_name: str) -> List[Tuple[str, float]]:
             if corrected_word.lower() not in suggestion_set:
                 suggestion_set[corrected_word.lower()] = _score / 100
             # Also query predictor with corrected prefix
-            extra = predictor.predict(
-                context, prefix=corrected_word.lower(), top_k=3
-            )
+            extra = predictor.predict(context, prefix=corrected_word.lower(), top_k=3)
             for w, p in extra:
                 if w not in suggestion_set:
                     suggestion_set[w] = p * 0.8
@@ -205,6 +221,7 @@ CUSTOM_CSS = """
 }
 """
 
+
 def build_app() -> gr.Blocks:
     with gr.Blocks(css=CUSTOM_CSS, title="Word Predictor") as demo:
 
@@ -235,9 +252,11 @@ def build_app() -> gr.Blocks:
         )
 
         # ---- Suggestion buttons ------------------------------------- #
-        gr.HTML('<p style="margin:8px 0 2px;font-weight:500;'
-                'font-size:0.85rem;color:var(--body-text-color-subdued)">'
-                'Suggestions  (click to insert)</p>')
+        gr.HTML(
+            '<p style="margin:8px 0 2px;font-weight:500;'
+            'font-size:0.85rem;color:var(--body-text-color-subdued)">'
+            "Suggestions  (click to insert)</p>"
+        )
 
         with gr.Row(elem_classes="suggestion-row"):
             btns = [
@@ -322,9 +341,7 @@ def build_app() -> gr.Blocks:
                 new_text = insert_suggestion(text, word)
 
                 # Immediately re-predict for the new state
-                return [new_text] + list(
-                    on_text_change(new_text, model_name)
-                )
+                return [new_text] + list(on_text_change(new_text, model_name))
 
             return handler
 
