@@ -20,7 +20,6 @@ from __future__ import annotations
 import math
 import os
 import re
-import tempfile
 from collections import Counter
 from typing import List, Tuple, Optional
 
@@ -39,7 +38,7 @@ from tokenizers.pre_tokenizers import Whitespace
 
 def build_bpe_tokenizer(
     corpus: str,
-    vocab_size: int = 500,
+    vocab_size: int = 1000,
     min_frequency: int = 2,
 ) -> Tokenizer:
     """Train a byte-pair-encoding tokenizer from raw text.
@@ -179,7 +178,7 @@ class SmallTransformerPredictor:
 
     def __init__(
         self,
-        vocab_size: int = 500,
+        vocab_size: int = 1000,
         d_model: int = 128,
         n_heads: int = 4,
         n_layers: int = 2,
@@ -224,7 +223,7 @@ class SmallTransformerPredictor:
         # Build the set of actual whole words from the corpus + their counts.
         # \b...\b avoids extracting letter fragments glued to digits, e.g.
         # "20th" / "1st" / "2nd" would otherwise yield bogus words th/st/nd.
-        words = re.findall(r"\b[a-z]+\b", corpus.lower())
+        words = re.findall(r"\b[a-z]+(?:['-][a-z]+)*\b", corpus.lower())
         self._word_freq = dict(Counter(words))
         self._corpus_words = set(self._word_freq)
 
@@ -320,76 +319,78 @@ class SmallTransformerPredictor:
             return [self.tokenizer.token_to_id("<bos>")]
         return self.tokenizer.encode(context_text).ids
 
-    def _get_next_probs(self, input_ids: List[int]) -> torch.Tensor:
-        """Run the model and return softmax probabilities for next token."""
-        ids = input_ids[-self.max_seq_len :]
-        inp = torch.tensor([ids], dtype=torch.long, device=self.device)
-        logits = self.model(inp)
-        return F.softmax(logits[0, -1, :], dim=-1)
-
     def _is_valid_prediction_word(self, word: str) -> bool:
         word = word.lower().strip()
-        if not word or not word.isalpha():
+
+        if not word:
             return False
+
         if len(word) == 1 and word not in {"a", "i"}:
             return False
+
+        if not re.fullmatch(r"[a-z]+(?:['-][a-z]+)*", word):
+            return False
+
         return word in self._corpus_words
 
     @torch.no_grad()
-    def _score_batched(self, ctx_ids, cand, prefix, top_k):
+    def _score_batched(self, ctx_ids, cand, top_k):
         if not cand:
             return []
+
         pad = self._pad_id
         seqs, meta = [], []
+
         for w in cand:
             wt = self.tokenizer.encode(w).ids
             if not wt:
                 continue
+
             seq = (ctx_ids + wt)[-self.max_seq_len :]
-            if len(seq) - len(wt) - 1 < 0:  # 没有位置去预测 wt[0],跳过
+            start = len(seq) - len(wt) - 1
+
+            if start < 0:
                 continue
+
             seqs.append(seq)
-            meta.append((w, len(wt), len(seq)))
+            meta.append((w, wt, start))
+
         if not seqs:
             return []
+
         L = max(len(s) for s in seqs)
         inp = torch.full((len(seqs), L), pad, dtype=torch.long, device=self.device)
+
         for i, s in enumerate(seqs):
-            inp[i, : len(s)] = torch.tensor(s, device=self.device)
-        logp = F.log_softmax(
-            self.model(inp), dim=-1
-        )  # 一次前向;pad 在末尾,因果 mask 下不污染打分位置
+            inp[i, : len(s)] = torch.tensor(s, dtype=torch.long, device=self.device)
+
+        logp = F.log_softmax(self.model(inp), dim=-1)
+
         scored = []
-        for i, (w, wl, sl) in enumerate(meta):
-            wt = self.tokenizer.encode(w).ids
-            start = sl - wl - 1
-            s = sum(logp[i, start + j, wt[j]].item() for j in range(wl))
-            scored.append((w, s / wl))
+
+        for i, (w, wt, start) in enumerate(meta):
+            score = sum(logp[i, start + j, wt[j]].item() for j in range(len(wt)))
+            scored.append((w, score))
+
         scored.sort(key=lambda x: -x[1])
         top = scored[:top_k]
-        exps = [math.exp(s) for _, s in top]
+
+        if not top:
+            return []
+
+        # stable softmax
+        m = top[0][1]
+        exps = [math.exp(s - m) for _, s in top]
         tot = sum(exps) or 1.0
+
         return [(w, round(e / tot, 4)) for (w, _), e in zip(top, exps)]
 
     @torch.no_grad()
-    def predict(self, context, prefix="", top_k=5, max_candidates=100):
+    def predict(self, context, prefix="", top_k=5, max_candidates=1000):
         if self.model is None or self.tokenizer is None:
             raise RuntimeError("Model not trained – call .train() first.")
         prefix = prefix.lower().strip()
         ctx_ids = self._encode_context(context)
-
-        # 空 / 单字母 prefix:本质是“下一个 token”,一次前向即可,不遍历词表
-        if len(prefix) < 2:
-            probs = self._get_next_probs(ctx_ids)
-            tp, ti = probs.topk(min(200, probs.shape[0]))
-            out = {}
-            for pv, t in zip(tp.tolist(), ti.tolist()):
-                w = self.tokenizer.decode([t]).strip().lower()
-                if self._is_valid_prediction_word(w) and w.startswith(prefix):
-                    out[w] = out.get(w, 0.0) + pv
-            ranked = sorted(out.items(), key=lambda x: -x[1])[:top_k]
-            tot = sum(s for _, s in ranked) or 1.0
-            return [(w, round(s / tot, 4)) for w, s in ranked]
 
         # 有 prefix:先按词频裁到 max_candidates,再批量打分
         freq = self._word_freq
@@ -400,7 +401,7 @@ class SmallTransformerPredictor:
         ]
         cand.sort(key=lambda w: -freq.get(w, 0))
         cand = cand[:max_candidates]
-        return self._score_batched(ctx_ids, cand, prefix, top_k)
+        return self._score_batched(ctx_ids, cand, top_k)
 
     # ------------------------------------------------------------------ #
     #  Persistence                                                        #
@@ -465,83 +466,3 @@ class SmallTransformerPredictor:
             f"layers={self.n_layers}, "
             f"params={n_params:,})"
         )
-
-
-# # ===================================================================== #
-# #  GPT2Predictor  (for use when HuggingFace Hub is reachable)            #
-# # ===================================================================== #
-
-
-# class GPT2Predictor:
-#     """Word predictor wrapping the pre-trained GPT-2 model.
-
-#     Requires internet to download weights on first use.
-#     After that, models are cached locally.
-
-#     Parameters
-#     ----------
-#     model_name : str   e.g. 'gpt2', 'gpt2-medium'
-#     """
-
-#     def __init__(self, model_name: str = "gpt2"):
-#         self.model_name = model_name
-#         self.device = "cuda" if torch.cuda.is_available() else "cpu"
-#         self.tokenizer = None
-#         self.model = None
-
-#     def load(self) -> None:
-#         """Download (or load from cache) the GPT-2 model."""
-#         from transformers import GPT2LMHeadModel, GPT2Tokenizer  # noqa: E402
-
-#         self.tokenizer = GPT2Tokenizer.from_pretrained(self.model_name)
-#         self.model = GPT2LMHeadModel.from_pretrained(self.model_name).to(self.device)
-#         self.model.eval()
-#         n_params = sum(p.numel() for p in self.model.parameters())
-#         print(f"  Loaded {self.model_name}: {n_params // 1_000_000}M params")
-
-#     @torch.no_grad()
-#     def predict(
-#         self,
-#         context: List[str],
-#         prefix: str = "",
-#         top_k: int = 5,
-#     ) -> List[Tuple[str, float]]:
-#         """Predict the next whole word (same API as NGramPredictor)."""
-#         if self.model is None:
-#             raise RuntimeError("Call .load() first.")
-
-#         prefix = prefix.lower().strip()
-#         context_text = " ".join(context).strip()
-#         if prefix:
-#             context_text += " " + prefix
-
-#         if not context_text:
-#             context_text = " "
-
-#         input_ids = self.tokenizer.encode(context_text, return_tensors="pt").to(
-#             self.device
-#         )
-#         logits = self.model(input_ids).logits
-#         next_logits = logits[0, -1, :]
-#         probs = F.softmax(next_logits, dim=-1)
-
-#         # GPT-2 BPE: tokens starting with 'Ġ' mark word boundaries
-#         raw_top_k = min(300, probs.shape[0])
-#         top_probs, top_ids = probs.topk(raw_top_k)
-
-#         word_scores: dict[str, float] = {}
-
-#         for prob_val, token_id in zip(top_probs.tolist(), top_ids.tolist()):
-#             token_str = self.tokenizer.decode([token_id]).strip().lower()
-#             if not token_str or not token_str.isalpha():
-#                 continue
-#             if token_str.startswith(prefix):
-#                 word_scores[token_str] = word_scores.get(token_str, 0.0) + prob_val
-
-#         ranked = sorted(word_scores.items(), key=lambda x: -x[1])[:top_k]
-#         total = sum(s for _, s in ranked) or 1.0
-#         return [(w, round(s / total, 4)) for w, s in ranked]
-
-#     def __repr__(self) -> str:
-#         status = "loaded" if self.model else "not loaded"
-#         return f"GPT2Predictor(model='{self.model_name}', {status})"
