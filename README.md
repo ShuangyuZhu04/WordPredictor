@@ -26,7 +26,7 @@ No pre-trained models or external datasets need to be downloaded manually. The B
 
 - **Two language models** with a shared prediction interface:
   - **N-Gram (trigram)** -- frequency tables with backoff from trigram to bigram to unigram. Sub-millisecond inference.
-  - **Transformer (causal LM)** -- BPE subword tokenizer and a GPT-style decoder trained from scratch. Uses a dual-path prediction strategy to aggregate subword token probabilities back into whole-word suggestions.
+  - **Transformer (causal LM)** -- BPE subword tokenizer and a GPT-style decoder trained from scratch. Re-ranks prefix-matching corpus words by the model's average per-token log-probability to turn subword scores into whole-word suggestions.
 - **Spell correction** -- Damerau-Levenshtein edit distance combined with corpus frequency ranking. Recovers from typos like `goverment -> government` and `teh -> the`.
 - **Real-time GUI** -- Gradio interface with keystroke-by-keystroke suggestion updates, clickable word pills, and live model switching.
 - **Rigorous evaluation** -- keystroke-saving simulation on held-out Brown corpus data, comparing clean text, noisy (typo) text, varying top-k values, and three ablation studies (n-gram order, BPE vocabulary size, training data volume).
@@ -108,13 +108,14 @@ Two-phase training:
 1. **BPE tokenizer** -- trained from scratch on the corpus using HuggingFace `tokenizers`. This satisfies the subword tokenization requirement.
 2. **Causal Transformer** -- a GPT-style decoder trained with a standard cross-entropy language modelling objective.
 
-The critical challenge is mapping subword token probabilities back to whole-word suggestions. This is handled with a **dual-path prediction strategy**:
+The critical challenge is mapping subword token probabilities back to whole-word suggestions. Rather than decoding tokens forward and trying to reassemble words, the model uses a **candidate re-ranking strategy** that scores whole words directly:
 
-- **Path A (context-only)**: the model receives only the context words (without the current prefix), predicts the next token, and filters the results by prefix match. This works well when the prefix is short or empty, avoiding the problem of BPE misinterpreting a partial word.
-- **Path B (context + prefix)**: when the prefix is 2+ characters, it is appended to the context so the model can use the partial word to predict its continuation. This is more effective for longer prefixes.
-- **Word assembly**: within each path, top-scoring BPE tokens that decode to known corpus words are accepted directly (fast path). For subword fragments, a greedy extension of up to 4 decoding steps attempts to build a complete word. Results from both paths are merged, de-duplicated, and ranked by probability.
+- **Candidate generation**: from the corpus vocabulary, collect every whole word that starts with the current prefix (the empty prefix matches all words). A validity filter drops non-alphabetic tokens and stray single letters (keeping only `a` and `i`).
+- **Frequency pruning**: candidates are sorted by their corpus frequency and truncated to `max_candidates` (200 by default). This keeps scoring fast and biases toward words the model is likely to have learned well.
+- **Batched scoring**: each candidate is BPE-encoded and appended to the context, and the whole batch is run through the model in a single forward pass. A candidate's score is the average per-token log-probability of its subword pieces given the context (length-normalised so longer words are not penalised). Trailing padding sits after the scored positions, so the causal mask keeps it from affecting any score.
+- **Ranking**: the top-`k` candidates by score are returned, with a softmax over their scores as the displayed confidence.
 
-All suggestions are validated against the corpus vocabulary, guaranteeing that only whole words are returned.
+Because candidates are drawn from the corpus vocabulary, only whole words are ever returned. (The vocabulary is built with a word-boundary regex, so letter fragments glued to digits such as `20th`/`1st` do not leak in as fake words.)
 
 #### Model Hyperparameters
 
@@ -240,7 +241,7 @@ Fair head-to-head on the same 493-word subset:
 
 ### Discussion
 
-**N-Gram vs Transformer.** On the same 493-word subset, the N-Gram saves 29.7% of keystrokes compared to the Transformer's 12.5%. The N-Gram dominates because it directly memorises word-level co-occurrences, while the Transformer must decode subword tokens back into whole words -- a lossy process when the BPE vocabulary (1,000 tokens) is much smaller than the corpus vocabulary (13,296 words). Despite the dual-path prediction strategy improving the Transformer's KS% from 5.3% (original single-path) to 12.5%, the fundamental bottleneck remains the subword-to-word conversion. With a larger corpus or pre-trained GPT-2 weights, the Transformer's generalisation from subword representations would be expected to close this gap.
+**N-Gram vs Transformer.** On the same 493-word subset, the N-Gram saves 29.7% of keystrokes compared to the Transformer's 12.5%. The N-Gram dominates because it directly memorises word-level co-occurrences, while the Transformer must decode subword tokens back into whole words -- a lossy process when the BPE vocabulary (1,000 tokens) is much smaller than the corpus vocabulary (13,296 words). Even with the candidate re-ranking strategy scoring whole words directly, the fundamental bottleneck remains the subword-to-word conversion. With a larger corpus or pre-trained GPT-2 weights, the Transformer's generalisation from subword representations would be expected to close this gap.
 
 **Spell correction: robustness vs efficiency.** On N-Gram, the corrector boosts typo-condition hit rate by 15.6 percentage points (71.3% to 86.9%) while also improving keystroke savings (+0.6 pp). On the Transformer, it raises hit rate dramatically (50.7% to 83.8%) but *decreases* keystroke savings from 11.8% to 8.8%. The reason is that spell-corrected suggestions require more prefix characters before a match is found (average prefix length increases from 0.85 to 2.79), consuming the keystrokes that would otherwise be saved. This reveals that spell correction's primary value is **robustness** (coverage under noisy input), not efficiency.
 

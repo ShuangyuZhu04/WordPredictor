@@ -21,6 +21,7 @@ import math
 import os
 import re
 import tempfile
+from collections import Counter
 from typing import List, Tuple, Optional
 
 import torch
@@ -196,6 +197,7 @@ class SmallTransformerPredictor:
         self._pad_id: int = 0
         self._word_cache: dict[str, int] = {}  # whole-word → token-id
         self._corpus_words: set[str] = set()  # actual words from training
+        self._word_freq: dict[str, int] = {}  # whole-word → corpus frequency
 
     # ------------------------------------------------------------------ #
     #  Training                                                           #
@@ -218,8 +220,12 @@ class SmallTransformerPredictor:
         actual_vocab = self.tokenizer.get_vocab_size()
         self._pad_id = self.tokenizer.token_to_id("<pad>")
 
-        # Build the set of actual whole words from the corpus
-        self._corpus_words = set(re.findall(r"[a-zA-Z]+", corpus.lower()))
+        # Build the set of actual whole words from the corpus + their counts.
+        # \b...\b avoids extracting letter fragments glued to digits, e.g.
+        # "20th" / "1st" / "2nd" would otherwise yield bogus words th/st/nd.
+        words = re.findall(r"\b[a-z]+\b", corpus.lower())
+        self._word_freq = dict(Counter(words))
+        self._corpus_words = set(self._word_freq)
 
         # Cache which BPE tokens are whole words (for fast filtering later)
         self._build_word_cache()
@@ -320,179 +326,67 @@ class SmallTransformerPredictor:
         logits = self.model(inp)
         return F.softmax(logits[0, -1, :], dim=-1)
 
+    def _is_valid_prediction_word(self, word: str) -> bool:
+        word = word.lower().strip()
+        if not word or not word.isalpha():
+            return False
+        if len(word) == 1 and word not in {"a", "i"}:
+            return False
+        return word in self._corpus_words
+
     @torch.no_grad()
-    def predict(
-        self,
-        context: List[str],
-        prefix: str = "",
-        top_k: int = 5,
-    ) -> List[Tuple[str, float]]:
-        """Predict the next whole word using dual-path strategy.
+    def _score_batched(self, ctx_ids, cand, prefix, top_k):
+        if not cand:
+            return []
+        pad = self._pad_id
+        seqs, meta = [], []
+        for w in cand:
+            wt = self.tokenizer.encode(w).ids
+            if not wt:
+                continue
+            seq = (ctx_ids + wt)[-self.max_seq_len :]
+            if len(seq) - len(wt) - 1 < 0:  # 没有位置去预测 wt[0],跳过
+                continue
+            seqs.append(seq)
+            meta.append((w, len(wt), len(seq)))
+        if not seqs:
+            return []
+        L = max(len(s) for s in seqs)
+        inp = torch.full((len(seqs), L), pad, dtype=torch.long, device=self.device)
+        for i, s in enumerate(seqs):
+            inp[i, : len(s)] = torch.tensor(s, device=self.device)
+        logp = F.log_softmax(
+            self.model(inp), dim=-1
+        )  # 一次前向;pad 在末尾,因果 mask 下不污染打分位置
+        scored = []
+        for i, (w, wl, sl) in enumerate(meta):
+            wt = self.tokenizer.encode(w).ids
+            start = sl - wl - 1
+            s = sum(logp[i, start + j, wt[j]].item() for j in range(wl))
+            scored.append((w, s / wl))
+        scored.sort(key=lambda x: -x[1])
+        top = scored[:top_k]
+        exps = [math.exp(s) for _, s in top]
+        tot = sum(exps) or 1.0
+        return [(w, round(e / tot, 4)) for (w, _), e in zip(top, exps)]
 
-        Path A – context only (no prefix fed to model):
-            Get raw next-token predictions, collect whole words that
-            match the prefix.  Best when prefix is empty or short.
-
-        Path B – context + prefix (prefix fed to model):
-            Let the model see the partial word and predict its
-            continuation.  Best when prefix is long enough for BPE
-            to encode meaningfully.
-
-        Results from both paths are merged and de-duplicated.
-        """
+    @torch.no_grad()
+    def predict(self, context, prefix="", top_k=5, max_candidates=200):
         if self.model is None or self.tokenizer is None:
             raise RuntimeError("Model not trained – call .train() first.")
-
         prefix = prefix.lower().strip()
-        word_scores: dict[str, float] = {}
-
-        # ---- Path A: context-only predictions ---- #
         ctx_ids = self._encode_context(context)
-        probs_a = self._get_next_probs(ctx_ids)
 
-        raw_top_n = min(200, probs_a.shape[0])
-        top_probs_a, top_ids_a = probs_a.topk(raw_top_n)
-
-        extend_budget_a = 10
-
-        for prob_val, token_id in zip(top_probs_a.tolist(), top_ids_a.tolist()):
-            token_str = self.tokenizer.decode([token_id]).strip().lower()
-            if not token_str or not token_str.isalpha():
-                continue
-
-            # Fast path: token is a known whole word matching prefix
-            if token_str in self._corpus_words and token_str.startswith(prefix):
-                word_scores[token_str] = word_scores.get(token_str, 0.0) + prob_val
-                continue
-
-            # Extension path: subword → try to build a whole word
-            if extend_budget_a > 0 and token_str.startswith(prefix[: len(token_str)]):
-                extend_budget_a -= 1
-                extended = self._beam_extend(
-                    ctx_ids + [token_id],
-                    token_str,
-                    prob_val,
-                    prefix=prefix,
-                )
-                for word, word_prob in extended:
-                    if word.startswith(prefix):
-                        word_scores[word] = word_scores.get(word, 0.0) + word_prob
-
-        # ---- Path B: context + prefix (only if prefix >= 2 chars) ---- #
-        if len(prefix) >= 2:
-            ctx_plus_prefix = " ".join(context).strip() + " " + prefix
-            enc_b = self.tokenizer.encode(ctx_plus_prefix)
-            ids_b = enc_b.ids
-
-            probs_b = self._get_next_probs(ids_b)
-            top_probs_b, top_ids_b = probs_b.topk(raw_top_n)
-            extend_budget_b = 10
-
-            # Figure out which tokens belong to the prefix encoding
-            ctx_only_enc = (
-                self.tokenizer.encode(" ".join(context).strip()).ids if context else []
-            )
-            prefix_token_ids = ids_b[len(ctx_only_enc) :]
-
-            path_b_weight = 0.8
-
-            for prob_val, token_id in zip(top_probs_b.tolist(), top_ids_b.tolist()):
-                # Decode prefix tokens + this continuation token
-                full_ids = prefix_token_ids + [token_id]
-                decoded = self.tokenizer.decode(full_ids).strip().lower()
-
-                if not decoded or not decoded.isalpha():
-                    continue
-
-                # Fast path: decoded is a complete known word
-                if decoded in self._corpus_words and decoded.startswith(prefix):
-                    word_scores[decoded] = (
-                        word_scores.get(decoded, 0.0) + prob_val * path_b_weight
-                    )
-                    continue
-
-                # Extension path
-                if extend_budget_b > 0 and decoded.startswith(prefix):
-                    extend_budget_b -= 1
-                    extended = self._beam_extend(
-                        ids_b + [token_id],
-                        decoded,
-                        prob_val * path_b_weight,
-                        prefix=prefix,
-                    )
-                    for word, word_prob in extended:
-                        if word.startswith(prefix):
-                            word_scores[word] = word_scores.get(word, 0.0) + word_prob
-
-        # Sort and return
-        ranked = sorted(word_scores.items(), key=lambda x: -x[1])[:top_k]
-        total = sum(s for _, s in ranked) or 1.0
-        return [(w, round(s / total, 4)) for w, s in ranked]
-
-    @torch.no_grad()
-    def _beam_extend(
-        self,
-        token_ids: List[int],
-        current_text: str,
-        base_prob: float,
-        prefix: str = "",
-        max_steps: int = 4,
-        beam_size: int = 5,
-    ) -> List[Tuple[str, float]]:
-        """Extend subword sequence with a small beam search."""
-        results: list[Tuple[str, float]] = []
-
-        # each beam item: (ids, text, score)
-        beams = [(list(token_ids), current_text, base_prob)]
-
-        special_ids = {
-            self.tokenizer.token_to_id("<pad>"),
-            self.tokenizer.token_to_id("<unk>"),
-            self.tokenizer.token_to_id("<bos>"),
-            self.tokenizer.token_to_id("<eos>"),
-        }
-
-        for _ in range(max_steps):
-            new_beams = []
-
-            for ids, text, score in beams:
-                probs = self._get_next_probs(ids)
-
-                top_probs, top_ids = probs.topk(beam_size)
-
-                for p, tid in zip(top_probs.tolist(), top_ids.tolist()):
-                    if tid in special_ids:
-                        continue
-
-                    token_piece = self.tokenizer.decode([tid]).strip().lower()
-                    if not token_piece or not token_piece.isalpha():
-                        continue
-
-                    new_text = text + token_piece
-
-                    if not new_text.isalpha():
-                        continue
-
-                    # prefix pruning
-                    if prefix and not new_text.startswith(prefix):
-                        continue
-
-                    new_score = score * p
-                    new_ids = ids + [tid]
-
-                    if new_text in self._corpus_words:
-                        results.append((new_text, new_score))
-
-                    new_beams.append((new_ids, new_text, new_score))
-
-            if not new_beams:
-                break
-
-            # keep best beams
-            new_beams.sort(key=lambda x: -x[2])
-            beams = new_beams[:beam_size]
-
-        return results
+        # 先按词频裁到 max_candidates,再批量打分
+        freq = self._word_freq
+        cand = [
+            w
+            for w in self._corpus_words
+            if self._is_valid_prediction_word(w) and w.startswith(prefix)
+        ]
+        cand.sort(key=lambda w: -freq.get(w, 0))
+        cand = cand[:max_candidates]
+        return self._score_batched(ctx_ids, cand, prefix, top_k)
 
     # ------------------------------------------------------------------ #
     #  Persistence                                                        #
@@ -501,9 +395,10 @@ class SmallTransformerPredictor:
         os.makedirs(directory, exist_ok=True)
         torch.save(self.model.state_dict(), os.path.join(directory, "model.pt"))
         self.tokenizer.save(os.path.join(directory, "tokenizer.json"))
-        # Save the corpus vocabulary for whole-word validation
+        # Save the corpus vocabulary + frequencies for whole-word validation
         with open(os.path.join(directory, "corpus_words.txt"), "w") as f:
-            f.write("\n".join(sorted(self._corpus_words)))
+            for w in sorted(self._word_freq, key=lambda x: (-self._word_freq[x], x)):
+                f.write(f"{w}\t{self._word_freq[w]}\n")
         print(f"  Saved model + tokenizer to {directory}/")
 
     def load(self, directory: str) -> None:
@@ -512,13 +407,23 @@ class SmallTransformerPredictor:
         self._pad_id = self.tokenizer.token_to_id("<pad>")
         self._build_word_cache()
 
-        # Load corpus vocabulary
+        # Load corpus vocabulary + frequencies
         words_path = os.path.join(directory, "corpus_words.txt")
         if os.path.exists(words_path):
+            self._word_freq = {}
             with open(words_path) as f:
-                self._corpus_words = set(f.read().strip().split("\n"))
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    parts = line.split("\t")
+                    word = parts[0]
+                    count = int(parts[1]) if len(parts) > 1 else 1
+                    self._word_freq[word] = count
+            self._corpus_words = set(self._word_freq)
         else:
             self._corpus_words = set(self._word_cache.keys())
+            self._word_freq = {w: 1 for w in self._corpus_words}
 
         self.model = CausalTransformerLM(
             vocab_size=actual_vocab,
