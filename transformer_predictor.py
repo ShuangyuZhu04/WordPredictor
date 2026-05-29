@@ -62,7 +62,7 @@ def build_bpe_tokenizer(
 
 
 # ===================================================================== #
-#  Small Causal Transformer (from scratch)                               #
+#  Small Causal Transformer                                             #
 # ===================================================================== #
 
 
@@ -102,6 +102,7 @@ class CausalTransformerLM(nn.Module):
             dropout=dropout,
             batch_first=True,
             norm_first=True,
+            activation="gelu",
         )
 
         self.transformer = nn.TransformerEncoder(

@@ -7,9 +7,7 @@ per-keystroke by filtering the vocabulary on the current prefix.
 
 from collections import defaultdict, Counter
 import re
-import math
-from typing import List, Tuple, Optional
-import nltk
+from typing import List, Tuple
 
 
 class NGramPredictor:
@@ -60,47 +58,92 @@ class NGramPredictor:
     # ------------------------------------------------------------------ #
     #  Prediction                                                         #
     # ------------------------------------------------------------------ #
+    # def predict(
+    #     self,
+    #     context: List[str],
+    #     prefix: str = "",
+    #     top_k: int = 5,
+    # ) -> List[Tuple[str, float]]:
+    #     """Return the *top_k* most likely next words.
+
+    #     Parameters
+    #     ----------
+    #     context : list[str]
+    #         The preceding words (already typed and confirmed).
+    #     prefix : str
+    #         The partially-typed current word (may be empty).
+    #     top_k : int
+    #         How many suggestions to return.
+
+    #     Returns
+    #     -------
+    #     list of (word, probability) pairs sorted by descending probability.
+    #     """
+    #     prefix = prefix.lower().strip()
+    #     context = [w.lower() for w in context]
+
+    #     # Try the highest-order model first, then back off.
+    #     candidates: Counter = Counter()
+    #     for order in range(self.n, 0, -1):
+    #         ctx_len = order - 1
+    #         ctx = tuple(context[-ctx_len:]) if ctx_len > 0 else ()
+
+    #         if ctx in self.ngram_counts[order]:
+    #             counts = self.ngram_counts[order][ctx]
+    #             # Filter by prefix
+    #             filtered = {w: c for w, c in counts.items() if w.startswith(prefix)}
+    #             if filtered:
+    #                 total = sum(filtered.values())
+    #                 for w, c in filtered.items():
+    #                     candidates[w] += c / total
+    #                 break  # stop at the highest useful order
+
+    #     results = [(w, round(s, 4)) for w, s in candidates.most_common(top_k)]
+    #     return results
     def predict(
         self,
         context: List[str],
         prefix: str = "",
         top_k: int = 5,
     ) -> List[Tuple[str, float]]:
-        """Return the *top_k* most likely next words.
 
-        Parameters
-        ----------
-        context : list[str]
-            The preceding words (already typed and confirmed).
-        prefix : str
-            The partially-typed current word (may be empty).
-        top_k : int
-            How many suggestions to return.
-
-        Returns
-        -------
-        list of (word, probability) pairs sorted by descending probability.
-        """
         prefix = prefix.lower().strip()
         context = [w.lower() for w in context]
 
-        # Try the highest-order model first, then back off.
         candidates: Counter = Counter()
+
+        # General order-proportional interpolation weights
+        # Higher-order n-grams get larger weights
+        raw_weights = {order: order for order in range(1, self.n + 1)}
+        weight_sum = sum(raw_weights.values())
+        weights = {order: raw_weights[order] / weight_sum for order in raw_weights}
+
+        # Linear interpolation across all n-gram orders
         for order in range(self.n, 0, -1):
             ctx_len = order - 1
             ctx = tuple(context[-ctx_len:]) if ctx_len > 0 else ()
 
-            if ctx in self.ngram_counts[order]:
-                counts = self.ngram_counts[order][ctx]
-                # Filter by prefix
-                filtered = {w: c for w, c in counts.items() if w.startswith(prefix)}
-                if filtered:
-                    total = sum(filtered.values())
-                    for w, c in filtered.items():
-                        candidates[w] += c / total
-                    break  # stop at the highest useful order
+            if ctx not in self.ngram_counts[order]:
+                continue
 
-        results = [(w, round(s, 4)) for w, s in candidates.most_common(top_k)]
+            counts = self.ngram_counts[order][ctx]
+
+            total = sum(counts.values())
+
+            for w, c in counts.items():
+                if w.startswith(prefix):
+                    prob = c / total
+                    candidates[w] += weights[order] * prob
+
+        if not candidates:
+            return []
+
+        # Normalize only over displayed prefix-matching candidates
+        total_score = sum(candidates.values()) or 1
+        results = [
+            (w, round(s / total_score, 4)) for w, s in candidates.most_common(top_k)
+        ]
+
         return results
 
     # ------------------------------------------------------------------ #
