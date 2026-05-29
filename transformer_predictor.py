@@ -368,8 +368,11 @@ class SmallTransformerPredictor:
             # Extension path: subword → try to build a whole word
             if extend_budget_a > 0 and token_str.startswith(prefix[: len(token_str)]):
                 extend_budget_a -= 1
-                extended = self._greedy_extend(
-                    ctx_ids + [token_id], token_str, prob_val
+                extended = self._beam_extend(
+                    ctx_ids + [token_id],
+                    token_str,
+                    prob_val,
+                    prefix=prefix,
                 )
                 for word, word_prob in extended:
                     if word.startswith(prefix):
@@ -391,6 +394,8 @@ class SmallTransformerPredictor:
             )
             prefix_token_ids = ids_b[len(ctx_only_enc) :]
 
+            path_b_weight = 0.8
+
             for prob_val, token_id in zip(top_probs_b.tolist(), top_ids_b.tolist()):
                 # Decode prefix tokens + this continuation token
                 full_ids = prefix_token_ids + [token_id]
@@ -402,15 +407,18 @@ class SmallTransformerPredictor:
                 # Fast path: decoded is a complete known word
                 if decoded in self._corpus_words and decoded.startswith(prefix):
                     word_scores[decoded] = (
-                        word_scores.get(decoded, 0.0) + prob_val * 0.8
+                        word_scores.get(decoded, 0.0) + prob_val * path_b_weight
                     )
                     continue
 
                 # Extension path
                 if extend_budget_b > 0 and decoded.startswith(prefix):
                     extend_budget_b -= 1
-                    extended = self._greedy_extend(
-                        ids_b + [token_id], decoded, prob_val * 0.8
+                    extended = self._beam_extend(
+                        ids_b + [token_id],
+                        decoded,
+                        prob_val * path_b_weight,
+                        prefix=prefix,
                     )
                     for word, word_prob in extended:
                         if word.startswith(prefix):
@@ -422,37 +430,67 @@ class SmallTransformerPredictor:
         return [(w, round(s / total, 4)) for w, s in ranked]
 
     @torch.no_grad()
-    def _greedy_extend(
+    def _beam_extend(
         self,
         token_ids: List[int],
         current_text: str,
         base_prob: float,
+        prefix: str = "",
         max_steps: int = 4,
+        beam_size: int = 5,
     ) -> List[Tuple[str, float]]:
-        """Greedily extend a subword sequence until a known word forms.
-
-        Fast: single forward pass per step (no beam branching).
-        """
+        """Extend subword sequence with a small beam search."""
         results: list[Tuple[str, float]] = []
-        ids = list(token_ids)
-        cum_prob = base_prob
-        text = current_text
+
+        # each beam item: (ids, text, score)
+        beams = [(list(token_ids), current_text, base_prob)]
+
+        special_ids = {
+            self.tokenizer.token_to_id("<pad>"),
+            self.tokenizer.token_to_id("<unk>"),
+            self.tokenizer.token_to_id("<bos>"),
+            self.tokenizer.token_to_id("<eos>"),
+        }
 
         for _ in range(max_steps):
-            probs = self._get_next_probs(ids)
-            best_prob, best_id = probs.max(dim=-1)
-            ids.append(best_id.item())
-            cum_prob *= best_prob.item()
+            new_beams = []
 
-            new_token = self.tokenizer.decode([best_id.item()]).strip().lower()
-            text += new_token
+            for ids, text, score in beams:
+                probs = self._get_next_probs(ids)
 
-            if not text.isalpha():
+                top_probs, top_ids = probs.topk(beam_size)
+
+                for p, tid in zip(top_probs.tolist(), top_ids.tolist()):
+                    if tid in special_ids:
+                        continue
+
+                    token_piece = self.tokenizer.decode([tid]).strip().lower()
+                    if not token_piece or not token_piece.isalpha():
+                        continue
+
+                    new_text = text + token_piece
+
+                    if not new_text.isalpha():
+                        continue
+
+                    # prefix pruning
+                    if prefix and not new_text.startswith(prefix):
+                        continue
+
+                    new_score = score * p
+                    new_ids = ids + [tid]
+
+                    if new_text in self._corpus_words:
+                        results.append((new_text, new_score))
+
+                    new_beams.append((new_ids, new_text, new_score))
+
+            if not new_beams:
                 break
-            if text in self._corpus_words:
-                results.append((text, cum_prob))
-            if cum_prob < 1e-6:
-                break
+
+            # keep best beams
+            new_beams.sort(key=lambda x: -x[2])
+            beams = new_beams[:beam_size]
 
         return results
 
