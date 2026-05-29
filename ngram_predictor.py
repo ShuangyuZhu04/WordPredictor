@@ -34,7 +34,7 @@ class NGramPredictor:
             order: defaultdict(Counter) for order in range(1, n + 1)
         }
         self.vocabulary: set[str] = set()
-        self.word_freq: Counter = Counter()        # raw unigram counts
+        self.word_freq: Counter = Counter()  # raw unigram counts
         self._total_tokens: int = 0
 
     # ---- text normalisation ------------------------------------------ #
@@ -53,7 +53,7 @@ class NGramPredictor:
         for order in range(1, self.n + 1):
             for i in range(len(tokens) - order + 1):
                 window = tokens[i : i + order]
-                context = tuple(window[:-1])        # empty tuple for unigram
+                context = tuple(window[:-1])  # empty tuple for unigram
                 word = window[-1]
                 self.ngram_counts[order][context][word] += 1
 
@@ -93,28 +93,25 @@ class NGramPredictor:
             if ctx in self.ngram_counts[order]:
                 counts = self.ngram_counts[order][ctx]
                 # Filter by prefix
-                filtered = {
-                    w: c for w, c in counts.items() if w.startswith(prefix)
-                }
+                filtered = {w: c for w, c in counts.items() if w.startswith(prefix)}
                 if filtered:
                     total = sum(filtered.values())
                     for w, c in filtered.items():
                         # Weighted back-off: higher-order models dominate
                         weight = order / self.n
-                        candidates[w] += (c / total) * weight
+                        candidates[w] += (c / total) * weight  # type: ignore
                     break  # stop at the highest useful order
 
         # Fall back to pure unigram frequency if nothing matched
         if not candidates:
             for w, c in self.word_freq.items():
                 if w.startswith(prefix):
-                    candidates[w] = c / self._total_tokens
+                    candidates[w] = c / self._total_tokens  # type: ignore
 
         # Normalise scores to sum to 1
         total_score = sum(candidates.values()) or 1
         results = [
-            (w, round(s / total_score, 4))
-            for w, s in candidates.most_common(top_k)
+            (w, round(s / total_score, 4)) for w, s in candidates.most_common(top_k)
         ]
         return results
 

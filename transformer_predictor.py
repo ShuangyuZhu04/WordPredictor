@@ -35,6 +35,7 @@ from tokenizers.pre_tokenizers import Whitespace
 #  BPE tokenizer helper                                                  #
 # ===================================================================== #
 
+
 def build_bpe_tokenizer(
     corpus: str,
     vocab_size: int = 500,
@@ -62,6 +63,7 @@ def build_bpe_tokenizer(
 # ===================================================================== #
 #  Small Causal Transformer (from scratch)                               #
 # ===================================================================== #
+
 
 class CausalTransformerLM(nn.Module):
     """Minimal GPT-style causal language model.
@@ -92,14 +94,18 @@ class CausalTransformerLM(nn.Module):
         self.token_emb = nn.Embedding(vocab_size, d_model, padding_idx=0)
         self.pos_emb = nn.Embedding(max_seq_len, d_model)
 
-        decoder_layer = nn.TransformerDecoderLayer(
+        encoder_layer = nn.TransformerEncoderLayer(
             d_model=d_model,
             nhead=n_heads,
             dim_feedforward=d_model * 4,
             dropout=dropout,
             batch_first=True,
         )
-        self.decoder = nn.TransformerDecoder(decoder_layer, num_layers=n_layers)
+
+        self.transformer = nn.TransformerEncoder(
+            encoder_layer,
+            num_layers=n_layers,
+        )
         self.ln_f = nn.LayerNorm(d_model)
         self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
 
@@ -140,14 +146,10 @@ class CausalTransformerLM(nn.Module):
 
         causal = self._causal_mask(T, device)
 
-        # nn.TransformerDecoder expects (memory, tgt).  We use a dummy
-        # single-vector memory and rely entirely on tgt self-attention.
-        memory = torch.zeros(B, 1, self.d_model, device=device)
-        x = self.decoder(
-            tgt=x,
-            memory=memory,
-            tgt_mask=causal,
-            tgt_key_padding_mask=padding_mask,
+        x = self.transformer(
+            x,
+            mask=causal,
+            src_key_padding_mask=padding_mask,
         )
         x = self.ln_f(x)
         return self.lm_head(x)
@@ -156,6 +158,7 @@ class CausalTransformerLM(nn.Module):
 # ===================================================================== #
 #  SmallTransformerPredictor                                             #
 # ===================================================================== #
+
 
 class SmallTransformerPredictor:
     """Self-contained Transformer word predictor.
@@ -191,7 +194,7 @@ class SmallTransformerPredictor:
         self.model: Optional[CausalTransformerLM] = None
         self._pad_id: int = 0
         self._word_cache: dict[str, int] = {}  # whole-word → token-id
-        self._corpus_words: set[str] = set()   # actual words from training
+        self._corpus_words: set[str] = set()  # actual words from training
 
     # ------------------------------------------------------------------ #
     #  Training                                                           #
@@ -248,9 +251,7 @@ class SmallTransformerPredictor:
 
         # 5. Training loop
         optimizer = torch.optim.AdamW(self.model.parameters(), lr=lr)
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer, T_max=epochs
-        )
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
         loss_fn = nn.CrossEntropyLoss(ignore_index=self._pad_id)
 
         epoch_losses: List[float] = []
@@ -353,31 +354,25 @@ class SmallTransformerPredictor:
 
         extend_budget_a = 10
 
-        for prob_val, token_id in zip(
-            top_probs_a.tolist(), top_ids_a.tolist()
-        ):
+        for prob_val, token_id in zip(top_probs_a.tolist(), top_ids_a.tolist()):
             token_str = self.tokenizer.decode([token_id]).strip().lower()
             if not token_str or not token_str.isalpha():
                 continue
 
             # Fast path: token is a known whole word matching prefix
             if token_str in self._corpus_words and token_str.startswith(prefix):
-                word_scores[token_str] = (
-                    word_scores.get(token_str, 0.0) + prob_val
-                )
+                word_scores[token_str] = word_scores.get(token_str, 0.0) + prob_val
                 continue
 
             # Extension path: subword → try to build a whole word
-            if extend_budget_a > 0 and token_str.startswith(prefix[:len(token_str)]):
+            if extend_budget_a > 0 and token_str.startswith(prefix[: len(token_str)]):
                 extend_budget_a -= 1
                 extended = self._greedy_extend(
                     ctx_ids + [token_id], token_str, prob_val
                 )
                 for word, word_prob in extended:
                     if word.startswith(prefix):
-                        word_scores[word] = (
-                            word_scores.get(word, 0.0) + word_prob
-                        )
+                        word_scores[word] = word_scores.get(word, 0.0) + word_prob
 
         # ---- Path B: context + prefix (only if prefix >= 2 chars) ---- #
         if len(prefix) >= 2:
@@ -390,14 +385,12 @@ class SmallTransformerPredictor:
             extend_budget_b = 10
 
             # Figure out which tokens belong to the prefix encoding
-            ctx_only_enc = self.tokenizer.encode(
-                " ".join(context).strip()
-            ).ids if context else []
-            prefix_token_ids = ids_b[len(ctx_only_enc):]
+            ctx_only_enc = (
+                self.tokenizer.encode(" ".join(context).strip()).ids if context else []
+            )
+            prefix_token_ids = ids_b[len(ctx_only_enc) :]
 
-            for prob_val, token_id in zip(
-                top_probs_b.tolist(), top_ids_b.tolist()
-            ):
+            for prob_val, token_id in zip(top_probs_b.tolist(), top_ids_b.tolist()):
                 # Decode prefix tokens + this continuation token
                 full_ids = prefix_token_ids + [token_id]
                 decoded = self.tokenizer.decode(full_ids).strip().lower()
@@ -420,9 +413,7 @@ class SmallTransformerPredictor:
                     )
                     for word, word_prob in extended:
                         if word.startswith(prefix):
-                            word_scores[word] = (
-                                word_scores.get(word, 0.0) + word_prob
-                            )
+                            word_scores[word] = word_scores.get(word, 0.0) + word_prob
 
         # Sort and return
         ranked = sorted(word_scores.items(), key=lambda x: -x[1])[:top_k]
@@ -477,9 +468,7 @@ class SmallTransformerPredictor:
         print(f"  Saved model + tokenizer to {directory}/")
 
     def load(self, directory: str) -> None:
-        self.tokenizer = Tokenizer.from_file(
-            os.path.join(directory, "tokenizer.json")
-        )
+        self.tokenizer = Tokenizer.from_file(os.path.join(directory, "tokenizer.json"))
         actual_vocab = self.tokenizer.get_vocab_size()
         self._pad_id = self.tokenizer.token_to_id("<pad>")
         self._build_word_cache()
@@ -510,11 +499,7 @@ class SmallTransformerPredictor:
         print(f"  Loaded model + tokenizer from {directory}/")
 
     def __repr__(self) -> str:
-        n_params = (
-            sum(p.numel() for p in self.model.parameters())
-            if self.model
-            else 0
-        )
+        n_params = sum(p.numel() for p in self.model.parameters()) if self.model else 0
         return (
             f"SmallTransformerPredictor("
             f"vocab={self.vocab_size}, "
@@ -527,6 +512,7 @@ class SmallTransformerPredictor:
 # ===================================================================== #
 #  GPT2Predictor  (for use when HuggingFace Hub is reachable)            #
 # ===================================================================== #
+
 
 class GPT2Predictor:
     """Word predictor wrapping the pre-trained GPT-2 model.
@@ -550,9 +536,7 @@ class GPT2Predictor:
         from transformers import GPT2LMHeadModel, GPT2Tokenizer  # noqa: E402
 
         self.tokenizer = GPT2Tokenizer.from_pretrained(self.model_name)
-        self.model = GPT2LMHeadModel.from_pretrained(self.model_name).to(
-            self.device
-        )
+        self.model = GPT2LMHeadModel.from_pretrained(self.model_name).to(self.device)
         self.model.eval()
         n_params = sum(p.numel() for p in self.model.parameters())
         print(f"  Loaded {self.model_name}: {n_params // 1_000_000}M params")
@@ -594,9 +578,7 @@ class GPT2Predictor:
             if not token_str or not token_str.isalpha():
                 continue
             if token_str.startswith(prefix):
-                word_scores[token_str] = (
-                    word_scores.get(token_str, 0.0) + prob_val
-                )
+                word_scores[token_str] = word_scores.get(token_str, 0.0) + prob_val
 
         ranked = sorted(word_scores.items(), key=lambda x: -x[1])[:top_k]
         total = sum(s for _, s in ranked) or 1.0
