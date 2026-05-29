@@ -371,13 +371,26 @@ class SmallTransformerPredictor:
         return [(w, round(e / tot, 4)) for (w, _), e in zip(top, exps)]
 
     @torch.no_grad()
-    def predict(self, context, prefix="", top_k=5, max_candidates=200):
+    def predict(self, context, prefix="", top_k=5, max_candidates=100):
         if self.model is None or self.tokenizer is None:
             raise RuntimeError("Model not trained – call .train() first.")
         prefix = prefix.lower().strip()
         ctx_ids = self._encode_context(context)
 
-        # 先按词频裁到 max_candidates,再批量打分
+        # 空 / 单字母 prefix:本质是“下一个 token”,一次前向即可,不遍历词表
+        if len(prefix) < 2:
+            probs = self._get_next_probs(ctx_ids)
+            tp, ti = probs.topk(min(200, probs.shape[0]))
+            out = {}
+            for pv, t in zip(tp.tolist(), ti.tolist()):
+                w = self.tokenizer.decode([t]).strip().lower()
+                if self._is_valid_prediction_word(w) and w.startswith(prefix):
+                    out[w] = out.get(w, 0.0) + pv
+            ranked = sorted(out.items(), key=lambda x: -x[1])[:top_k]
+            tot = sum(s for _, s in ranked) or 1.0
+            return [(w, round(s / tot, 4)) for w, s in ranked]
+
+        # 有 prefix:先按词频裁到 max_candidates,再批量打分
         freq = self._word_freq
         cand = [
             w

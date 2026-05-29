@@ -110,8 +110,9 @@ Two-phase training:
 
 The critical challenge is mapping subword token probabilities back to whole-word suggestions. Rather than decoding tokens forward and trying to reassemble words, the model uses a **candidate re-ranking strategy** that scores whole words directly:
 
-- **Candidate generation**: from the corpus vocabulary, collect every whole word that starts with the current prefix (the empty prefix matches all words). A validity filter drops non-alphabetic tokens and stray single letters (keeping only `a` and `i`).
-- **Frequency pruning**: candidates are sorted by their corpus frequency and truncated to `max_candidates` (200 by default). This keeps scoring fast and biases toward words the model is likely to have learned well.
+- **Short / empty prefix (fast path)**: when the prefix is under 2 characters, predicting the next whole word is essentially predicting the next token, so a single forward pass is run and the top tokens that decode to valid corpus words are returned directly -- no vocabulary scan needed.
+- **Candidate generation**: for longer prefixes, collect every whole word in the corpus vocabulary that starts with the current prefix. A validity filter drops non-alphabetic tokens and stray single letters (keeping only `a` and `i`).
+- **Frequency pruning**: candidates are sorted by their corpus frequency and truncated to `max_candidates` (100 by default). This keeps scoring fast and biases toward words the model is likely to have learned well.
 - **Batched scoring**: each candidate is BPE-encoded and appended to the context, and the whole batch is run through the model in a single forward pass. A candidate's score is the average per-token log-probability of its subword pieces given the context (length-normalised so longer words are not penalised). Trailing padding sits after the scored positions, so the causal mask keeps it from affecting any score.
 - **Ranking**: the top-`k` candidates by score are returned, with a softmax over their scores as the displayed confidence.
 
