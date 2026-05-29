@@ -68,7 +68,7 @@ def load_models():
         print("Training Transformer model …")
         transformer.train(
             TRAIN_CORPUS,
-            epochs=60,
+            epochs=40,
             lr=3e-3,
             batch_size=16,
             seq_len=32,
