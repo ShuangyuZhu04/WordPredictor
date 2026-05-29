@@ -97,22 +97,10 @@ class NGramPredictor:
                 if filtered:
                     total = sum(filtered.values())
                     for w, c in filtered.items():
-                        # Weighted back-off: higher-order models dominate
-                        weight = order / self.n
-                        candidates[w] += (c / total) * weight  # type: ignore
+                        candidates[w] += c / total
                     break  # stop at the highest useful order
 
-        # Fall back to pure unigram frequency if nothing matched
-        if not candidates:
-            for w, c in self.word_freq.items():
-                if w.startswith(prefix):
-                    candidates[w] = c / self._total_tokens  # type: ignore
-
-        # Normalise scores to sum to 1
-        total_score = sum(candidates.values()) or 1
-        results = [
-            (w, round(s / total_score, 4)) for w, s in candidates.most_common(top_k)
-        ]
+        results = [(w, round(s, 4)) for w, s in candidates.most_common(top_k)]
         return results
 
     # ------------------------------------------------------------------ #
