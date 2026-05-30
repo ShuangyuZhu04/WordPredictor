@@ -119,28 +119,26 @@ def parse_input(text: str) -> Tuple[List[str], str]:
 
 
 def get_predictions(text: str, model_name: str) -> List[Tuple[str, float]]:
-    """Run the selected model and return predictions."""
     context, prefix = parse_input(text)
 
     use_spell = "Spell" in model_name
     use_transformer = "Transformer" in model_name
     predictor = TRANSFORMER if use_transformer else NGRAM
 
-    # Base predictions
     preds = predictor.predict(context, prefix=prefix, top_k=TOP_K)
-    suggestion_set = {w: p for w, p in preds}
+    suggestion_set = {w.lower(): p for w, p in preds}
 
-    # Augment with spell-corrected predictions
     if use_spell and prefix and not SPELL.is_known(prefix):
         corrections = SPELL.correct(prefix, top_k=TOP_K)
-        for corrected_word, _dist, _score in corrections:
-            if corrected_word.lower() not in suggestion_set:
-                suggestion_set[corrected_word.lower()] = _score / 100
-            # Also query predictor with corrected prefix
-            extra = predictor.predict(context, prefix=corrected_word.lower(), top_k=3)
-            for w, p in extra:
-                if w not in suggestion_set:
-                    suggestion_set[w] = p * 0.8
+
+        for corrected_word, dist, _score in corrections:
+            corrected_word = corrected_word.lower()
+
+            spell_prob = 0.6 / (dist + 1)
+
+            suggestion_set[corrected_word] = max(
+                suggestion_set.get(corrected_word, 0), spell_prob
+            )
 
     ranked = sorted(suggestion_set.items(), key=lambda x: -x[1])[:TOP_K]
     return ranked

@@ -312,6 +312,7 @@ class SmallTransformerPredictor:
     # ------------------------------------------------------------------ #
     #  Prediction                                                         #
     # ------------------------------------------------------------------ #
+    # 把上下文转换成id
     def _encode_context(self, context: List[str]) -> List[int]:
         """Encode context words into token IDs."""
         context_text = " ".join(context).strip()
@@ -319,6 +320,7 @@ class SmallTransformerPredictor:
             return [self.tokenizer.token_to_id("<bos>")]
         return self.tokenizer.encode(context_text).ids
 
+    # 检查是否是合法词汇
     def _is_valid_prediction_word(self, word: str) -> bool:
         word = word.lower().strip()
 
@@ -353,17 +355,20 @@ class SmallTransformerPredictor:
                 continue
 
             seqs.append(seq)
-            meta.append((w, wt, start))
+            meta.append(
+                (w, wt, start)
+            )  # 原始候选词，该词被编码后的ids，从哪个位置开始读取该词的预测概率
 
         if not seqs:
             return []
 
         L = max(len(s) for s in seqs)
+        # 候选词数量 × 最大序列长度 的矩阵，默认全部填 pad
         inp = torch.full((len(seqs), L), pad, dtype=torch.long, device=self.device)
-
+        # 把真实序列填进去
         for i, s in enumerate(seqs):
             inp[i, : len(s)] = torch.tensor(s, dtype=torch.long, device=self.device)
-
+        # Transformer 前向传播，并转成 log 概率
         logp = F.log_softmax(self.model(inp), dim=-1)
 
         scored = []
@@ -392,7 +397,7 @@ class SmallTransformerPredictor:
         prefix = prefix.lower().strip()
         ctx_ids = self._encode_context(context)
 
-        # 有 prefix:先按词频裁到 max_candidates,再批量打分
+        # 先按词频裁到 max_candidates,再批量打分
         freq = self._word_freq
         cand = [
             w

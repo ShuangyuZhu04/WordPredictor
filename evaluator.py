@@ -24,10 +24,10 @@ from typing import List, Tuple, Optional, Protocol
 
 from spell_corrector import SpellCorrector
 
-
 # ===================================================================== #
 #  Predictor protocol (any model that exposes .predict() will work)      #
 # ===================================================================== #
+
 
 class PredictorLike(Protocol):
     """Structural type shared by NGramPredictor, SmallTransformerPredictor,
@@ -45,21 +45,23 @@ class PredictorLike(Protocol):
 #  Per-word result                                                       #
 # ===================================================================== #
 
+
 @dataclass
 class WordResult:
     """Evaluation result for a single word."""
 
     target: str
-    keystrokes_without: int    # len(word) + 1
-    keystrokes_with: int       # c + 2  or  len(word) + 1
-    chars_typed: int           # how many chars the user typed before match
-    found: bool                # was the word found in top-k?
-    found_at_prefix_len: int   # prefix length when found (-1 if never)
+    keystrokes_without: int  # len(word) + 1
+    keystrokes_with: int  # c + 2  or  len(word) + 1
+    chars_typed: int  # how many chars the user typed before match
+    found: bool  # was the word found in top-k?
+    found_at_prefix_len: int  # prefix length when found (-1 if never)
 
 
 # ===================================================================== #
 #  Aggregate results                                                     #
 # ===================================================================== #
+
 
 @dataclass
 class EvalResult:
@@ -67,11 +69,11 @@ class EvalResult:
 
     model_name: str
     top_k: int
-    total_words: int                     = 0
-    words_found: int                     = 0
-    keystrokes_without: int              = 0
-    keystrokes_with: int                 = 0
-    word_results: List[WordResult]       = field(default_factory=list)
+    total_words: int = 0
+    words_found: int = 0
+    keystrokes_without: int = 0
+    keystrokes_with: int = 0
+    word_results: List[WordResult] = field(default_factory=list)
 
     # ---- derived metrics -------------------------------------------- #
     @property
@@ -104,6 +106,7 @@ class EvalResult:
 #  Typo simulator                                                        #
 # ===================================================================== #
 
+
 class TypoSimulator:
     """Introduce realistic typos into words for spell-correction evaluation.
 
@@ -113,13 +116,32 @@ class TypoSimulator:
     """
 
     QWERTY_NEIGHBOURS: dict[str, str] = {
-        "a": "sqwz",  "b": "vghn", "c": "xdfv", "d": "sfcer",
-        "e": "wrsdf", "f": "dgcvr", "g": "fhtbv", "h": "gjybn",
-        "i": "ujko",  "j": "hkunm", "k": "jloi", "l": "kop",
-        "m": "njk",   "n": "bhjm", "o": "iklp", "p": "ol",
-        "q": "wa",    "r": "edft", "s": "awedxz", "t": "rfgy",
-        "u": "yhji",  "v": "cfgb", "w": "qase", "x": "zsdc",
-        "y": "tghu",  "z": "asx",
+        "a": "sqwz",
+        "b": "vghn",
+        "c": "xdfv",
+        "d": "sfcer",
+        "e": "wrsdf",
+        "f": "dgcvr",
+        "g": "fhtbv",
+        "h": "gjybn",
+        "i": "ujko",
+        "j": "hkunm",
+        "k": "jloi",
+        "l": "kop",
+        "m": "njk",
+        "n": "bhjm",
+        "o": "iklp",
+        "p": "ol",
+        "q": "wa",
+        "r": "edft",
+        "s": "awedxz",
+        "t": "rfgy",
+        "u": "yhji",
+        "v": "cfgb",
+        "w": "qase",
+        "x": "zsdc",
+        "y": "tghu",
+        "z": "asx",
     }
 
     def __init__(self, typo_rate: float = 0.15, seed: int = 42):
@@ -166,6 +188,7 @@ class TypoSimulator:
 # ===================================================================== #
 #  Evaluator                                                             #
 # ===================================================================== #
+
 
 class Evaluator:
     """Simulate keystroke-by-keystroke typing and measure saved keystrokes.
@@ -247,7 +270,7 @@ class Evaluator:
 
             # --- 3. Check if target is among suggestions --------------- #
             if target_lower in suggestion_words:
-                ks_with = c + 2   # c typed chars + 1 click + 1 space
+                ks_with = c + 2  # c typed chars + 1 click + 1 space
                 return WordResult(
                     target=target,
                     keystrokes_without=ks_without,
@@ -295,20 +318,17 @@ class Evaluator:
         EvalResult with aggregate metrics.
         """
         import time as _time
+
         words = self.tokenize(test_text)
         result = EvalResult(model_name=model_name, top_k=self.top_k)
         total = len(words)
         t0 = _time.time()
 
         for i, target in enumerate(words):
-            context = words[max(0, i - 5) : i]   # up to 5 preceding words
+            context = words[max(0, i - 5) : i]  # up to 5 preceding words
 
             # Optionally corrupt the word to simulate typos
-            typed = (
-                typo_simulator.corrupt(target)
-                if typo_simulator
-                else target
-            )
+            typed = typo_simulator.corrupt(target) if typo_simulator else target
 
             wr = self._simulate_word(
                 predictor,
@@ -333,7 +353,8 @@ class Evaluator:
                 print(
                     f"\r  [{model_name}] {i+1}/{total} words "
                     f"({elapsed:.0f}s elapsed, ~{eta:.0f}s left)  ",
-                    end="", flush=True,
+                    end="",
+                    flush=True,
                 )
 
         if verbose and total > 0:
@@ -376,8 +397,10 @@ class Evaluator:
     def print_detail(result: EvalResult, max_rows: int = 20) -> None:
         """Print per-word breakdown (first *max_rows* words)."""
         print(f"\n  Per-word detail for: {result.model_name}")
-        print(f"  {'Word':<20s} {'Found':>6s} {'Prefix':>7s} "
-              f"{'KS w/o':>7s} {'KS w/':>7s} {'Saved':>6s}")
+        print(
+            f"  {'Word':<20s} {'Found':>6s} {'Prefix':>7s} "
+            f"{'KS w/o':>7s} {'KS w/':>7s} {'Saved':>6s}"
+        )
         print(f"  {'-' * 55}")
         for wr in result.word_results[:max_rows]:
             pfx = str(wr.found_at_prefix_len) if wr.found else "-"

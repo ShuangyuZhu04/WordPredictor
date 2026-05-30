@@ -62,17 +62,12 @@ class SpellCorrector:
             for j in range(1, len_t + 1):
                 cost = 0 if s[i - 1] == t[j - 1] else 1
                 d[i][j] = min(
-                    d[i - 1][j] + 1,        # deletion
-                    d[i][j - 1] + 1,         # insertion
+                    d[i - 1][j] + 1,  # deletion
+                    d[i][j - 1] + 1,  # insertion
                     d[i - 1][j - 1] + cost,  # substitution
                 )
                 # transposition
-                if (
-                    i > 1
-                    and j > 1
-                    and s[i - 1] == t[j - 2]
-                    and s[i - 2] == t[j - 1]
-                ):
+                if i > 1 and j > 1 and s[i - 1] == t[j - 2] and s[i - 2] == t[j - 1]:
                     d[i][j] = min(d[i][j], d[i - 2][j - 2] + 1)
         return d[len_s][len_t]
 
@@ -80,6 +75,7 @@ class SpellCorrector:
     #  Candidate generation (Peter Norvig-style edits)                    #
     # ------------------------------------------------------------------ #
     @staticmethod
+    # 生成所有和 word 相差 1 次编辑的字符串
     def _edits1(word: str) -> set[str]:
         """All strings that are one edit away from *word*."""
         letters = "abcdefghijklmnopqrstuvwxyz"
@@ -90,10 +86,12 @@ class SpellCorrector:
         inserts = [L + c + R for L, R in splits for c in letters]
         return set(deletes + transposes + replaces + inserts)
 
+    # 生成所有和 word 相差 2 次编辑的字符串
     def _edits2(self, word: str) -> set[str]:
         """All strings that are two edits away from *word*."""
         return {e2 for e1 in self._edits1(word) for e2 in self._edits1(e1)}
 
+    # 只保留语料中有的词
     def _known(self, words: set[str]) -> set[str]:
         """Filter to words that exist in the vocabulary."""
         return words & self.vocabulary
@@ -106,6 +104,7 @@ class SpellCorrector:
         word: str,
         top_k: int = 5,
     ) -> List[Tuple[str, int, float]]:
+        # 返回格式 候选词、编辑距离、分数
         """Suggest corrections for *word*.
 
         Returns
@@ -132,11 +131,7 @@ class SpellCorrector:
         # Only fall back to the expensive edits2 when edits1 found too
         # few candidates AND the word is long enough for edits2 to be
         # meaningful (short words produce ~50K junk candidates).
-        if (
-            self.max_edit_distance >= 2
-            and len(candidates) < top_k
-            and len(word) >= 4
-        ):
+        if self.max_edit_distance >= 2 and len(candidates) < top_k and len(word) >= 4:
             ed2 = self._known(self._edits2(word))
             candidates |= ed2
 
